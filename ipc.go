@@ -14,9 +14,11 @@ import (
 // Response received from mpv. Can be an event or a user requested response.
 type Response struct {
 	Err       string      `json:"error"`
-	Data      interface{} `json:"data"` // May contain float64, bool or string
+	Data      interface{} `json:"data"` // May contain float64, bool, string or map[string]interface{}
 	Event     string      `json:"event"`
 	RequestID int         `json:"request_id"`
+	ID        int         `json:"id"`   // observation id (only used in events)
+	Name      string      `json:"name"` // property name (only used in events)
 }
 
 // request sent to mpv. Includes request_id for mapping the response.
@@ -45,17 +47,21 @@ type IPCClient struct {
 	timeout time.Duration
 	comm    chan *request
 
-	mu     sync.Mutex
-	reqMap map[int]*request // Maps RequestIDs to Requests for response association
+	mu             sync.Mutex
+	reqMap         map[int]*request       // Maps RequestIDs to Requests for response association
+	obsMap         map[int]chan *Response // Maps Observation IDs to Requests for response association
+	MetadataUpdate chan struct{}
 }
 
 // NewIPCClient creates a new IPCClient connected to the given socket.
 func NewIPCClient(socket string) *IPCClient {
 	c := &IPCClient{
-		socket:  socket,
-		timeout: 2 * time.Second,
-		comm:    make(chan *request),
-		reqMap:  make(map[int]*request),
+		socket:         socket,
+		timeout:        2 * time.Second,
+		comm:           make(chan *request),
+		reqMap:         make(map[int]*request),
+		obsMap:         make(map[int]chan *Response),
+		MetadataUpdate: make(chan struct{}, 1),
 	}
 	c.run()
 	return c
@@ -73,6 +79,14 @@ func (c *IPCClient) dispatch(resp *Response) {
 		}
 		// Discard response
 	} else { // Event
+		if resp.Event == "property-change" {
+			if req, ok := c.obsMap[resp.ID]; ok { // Lookup requestID in request map
+				req <- resp
+				return
+			}
+		} else if resp.Event == "metadata-update" {
+			c.MetadataUpdate <- struct{}{}
+		}
 		// TODO: Implement Event support
 	}
 }
@@ -157,4 +171,32 @@ func (c *IPCClient) Exec(command ...interface{}) (*Response, error) {
 	case <-time.After(c.timeout):
 		return nil, ErrTimeoutRecv
 	}
+}
+
+func (c *IPCClient) Observe(id int, property string) (chan *Response, error) {
+	req, err := c.Exec("observe_property", id, property)
+	if err != nil {
+		return nil, err
+	}
+	if req.Err == "success" {
+		responseChan := make(chan *Response, 10)
+		c.obsMap[id] = responseChan
+
+		return responseChan, nil
+	} else {
+		return nil, errors.New("could not observe property " + property)
+	}
+}
+
+func (c *IPCClient) Unobserve(id int) (*Response, error) {
+	response, e := c.Exec("unobserve_property", id)
+	if e != nil {
+		return nil, e
+	}
+	if response.Err == "success" {
+		if _, ok := c.obsMap[id]; ok {
+			delete(c.obsMap, id)
+		}
+	}
+	return response, nil
 }
